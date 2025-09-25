@@ -1,5 +1,11 @@
 #!/usr/bin/env bash
-# first-boot-init.sh (v1.5)
+# first-boot-init.sh (v1.6)
+# HirusecOS · Primera configuración para Debian 13 (Trixie)
+# - Desactiva suspensión/hibernación *ANTES* de cualquier operación
+# - Normaliza repos APT (trixie / updates / security)
+# - Instala utilidades base (con fallback de disponibilidad)
+# - Configura locale/TZ, ajusta journald, SSH y UFW (opcional)
+
 set -euo pipefail
 log(){ echo -e "\e[1;32m[+] $*\e[0m"; }
 warn(){ echo -e "\e[1;33m[!] $*\e[0m"; }
@@ -16,8 +22,27 @@ ask_inputs(){
   read -rp "➡️  ¿Instalar Chrony (NTP)? [s/N]: " yn5; [[ "${yn5,,}" == "s" ]] && INST_CHRONY=1 || INST_CHRONY=0
 }
 
+disable_sleep(){
+  log "Deshabilitando suspensión/hibernación (aplicado primero)…"
+  cat > /etc/systemd/sleep.conf <<'EOF'
+[Sleep]
+AllowSuspend=no
+AllowHibernation=no
+AllowHybridSleep=no
+AllowSuspendThenHibernate=no
+EOF
+  if grep -q '^HandleLidSwitch=' /etc/systemd/logind.conf; then
+    sed -i 's/^HandleLidSwitch=.*/HandleLidSwitch=ignore/' /etc/systemd/logind.conf
+  else
+    echo "HandleLidSwitch=ignore" >> /etc/systemd/logind.conf
+  fi
+  systemctl mask sleep.target suspend.target hibernate.target hybrid-sleep.target suspend-then-hibernate.target || true
+  systemctl restart systemd-logind || true
+}
+
 normalize_apt_sources(){
   . /etc/os-release
+  log "Normalizando /etc/apt/sources.list…"
   cat > /etc/apt/sources.list <<EOF
 deb http://deb.debian.org/debian $VERSION_CODENAME main contrib non-free-firmware
 deb http://deb.debian.org/debian $VERSION_CODENAME-updates main contrib non-free-firmware
@@ -38,8 +63,8 @@ EOF
 pkg_available(){ apt-cache policy "$1" 2>/dev/null | awk '/Candidate:/{print $2}' | grep -vq "(none)"; }
 
 install_basics(){
-  log "Instalando utilidades base (filtrado por disponibilidad)…"
-  # Fallback de software-properties
+  log "Instalando utilidades base (según disponibilidad)…"
+  # Fallback para software-properties
   SPKG=""
   if pkg_available software-properties-common; then SPKG="software-properties-common";
   elif pkg_available python3-software-properties; then SPKG="python3-software-properties"; fi
@@ -61,12 +86,7 @@ install_basics(){
   for p in "${PKGS[@]}"; do
     if pkg_available "$p"; then TO_INSTALL+=("$p"); else warn "Paquete no disponible: $p (omitido)"; fi
   done
-
-  if ((${#TO_INSTALL[@]})); then
-    apt -y install "${TO_INSTALL[@]}"
-  else
-    warn "No hay paquetes para instalar (posible repos mal configurados)."
-  fi
+  ((${#TO_INSTALL[@]})) && apt -y install "${TO_INSTALL[@]}" || warn "Nada que instalar (revisa repos)."
 }
 
 configure_locale_tz(){
@@ -80,29 +100,15 @@ configure_locale_tz(){
   [[ "${CFG_TZ:-1}" -eq 1 ]] && { log "Zona horaria Europe/Madrid…"; timedatectl set-timezone Europe/Madrid; }
 }
 
-disable_sleep(){
-  log "Deshabilitando suspensión/hibernación…"
-  cat > /etc/systemd/sleep.conf <<'EOF'
-[Sleep]
-AllowSuspend=no
-AllowHibernation=no
-AllowHybridSleep=no
-AllowSuspendThenHibernate=no
-EOF
-  grep -q '^HandleLidSwitch=' /etc/systemd/logind.conf \
-    && sed -i 's/^HandleLidSwitch=.*/HandleLidSwitch=ignore/' /etc/systemd/logind.conf \
-    || echo "HandleLidSwitch=ignore" >> /etc/systemd/logind.conf
-  systemctl mask sleep.target suspend.target hibernate.target hybrid-sleep.target suspend-then-hibernate.target || true
-  systemctl restart systemd-logind || true
-}
-
 journald_limits(){
   log "Journal persistente (1G)…"
   mkdir -p /var/log/journal
   sed -i -E 's/^#?Storage=.*/Storage=persistent/' /etc/systemd/journald.conf || echo "Storage=persistent" >> /etc/systemd/journald.conf
-  grep -q '^SystemMaxUse=' /etc/systemd/journald.conf \
-    && sed -i 's/^SystemMaxUse=.*/SystemMaxUse=1G/' /etc/systemd/journald.conf \
-    || echo "SystemMaxUse=1G" >> /etc/systemd/journald.conf
+  if grep -q '^SystemMaxUse=' /etc/systemd/journald.conf; then
+    sed -i 's/^SystemMaxUse=.*/SystemMaxUse=1G/' /etc/systemd/journald.conf
+  else
+    echo "SystemMaxUse=1G" >> /etc/systemd/journald.conf
+  fi
   systemctl restart systemd-journald
 }
 
@@ -141,5 +147,17 @@ finish(){
   echo "UFW:  $(command -v ufw >/dev/null && ufw status | head -n1 || echo no-instalado)"
 }
 
-main(){ require_root; check_debian; ask_inputs; normalize_apt_sources; install_basics; configure_locale_tz; disable_sleep; journald_limits; ssh_setup; ufw_setup; finish; }
+main(){
+  require_root
+  check_debian
+  ask_inputs
+  disable_sleep             # <- PRIMERO
+  normalize_apt_sources
+  install_basics
+  configure_locale_tz
+  journald_limits
+  ssh_setup
+  ufw_setup
+  finish
+}
 main "$@"
