@@ -1,21 +1,20 @@
 #!/usr/bin/env bash
 # install-pve9-trixie-onepass.sh
-# Proxmox VE 9 sobre Debian 13 (Trixie) en una sola pasada:
-#  - Repo + keyring PVE (no-subscription)
-#  - proxmox-default-kernel + proxmox-ve + open-iscsi + ifupdown2 (+ chrony opcional)
-#  - Hostname/FQDN + /etc/hosts
-#  - Configuración de red interactiva con vmbr0 (DHCP o estática)
-#  - Desactivar repo enterprise, quitar banner suscripción (community-scripts; fallback local)
-#  - Eliminar kernels Debian + os-prober
-#  - Reboot final (único)
+# Proxmox VE 9 sobre Debian 13 (Trixie) en una sola pasada, con selección de NIC e IP en vmbr0
+# - Repo/keyring PVE (no-subscription)
+# - proxmox-default-kernel + proxmox-ve + open-iscsi + ifupdown2 (+ chrony opcional)
+# - Hostname/FQDN + /etc/hosts
+# - Menú para elegir NIC física y configurar vmbr0 (IP estática o DHCP) — IP SIEMPRE en el bridge
+# - Desactivar enterprise repo, quitar banner (community-scripts; fallback local)
+# - Eliminar kernels Debian + os-prober
+# - Backup de /etc/network/interfaces antes de escribir
+# - Reboot final único
 
 set -euo pipefail
-
 log(){ echo -e "\e[1;32m[+] $*\e[0m"; }
 warn(){ echo -e "\e[1;33m[!] $*\e[0m"; }
 err(){ echo -e "\e[1;31m[ERROR] $*\e[0m"; }
 die(){ err "$*"; exit 1; }
-
 require_root(){ [[ "$(id -u)" -eq 0 ]] || die "Ejecuta como root."; }
 
 check_env(){
@@ -28,10 +27,8 @@ check_env(){
 ask_inputs(){
   read -rp "➡️  FQDN del host (ej. pve.hirusec.lan): " FQDN
   [[ -n "$FQDN" ]] || die "El FQDN es obligatorio."
-
   read -rp "➡️  Instalar Chrony (NTP)? [s/N]: " yn
   [[ "${yn,,}" == "s" ]] && INSTALL_CHRONY=1 || INSTALL_CHRONY=0
-
   read -rp "➡️  Aplicar optimizaciones (no-subscription, quitar banner, ajustes APT)? [S/n]: " yn2
   [[ "${yn2,,}" == "n" ]] && RUN_TWEAKS=0 || RUN_TWEAKS=1
 }
@@ -149,19 +146,46 @@ nag_remove_fallback(){
   fi
 }
 
+select_nic(){
+  log "Detectando interfaces de red…"
+  mapfile -t NICS < <(ls -1 /sys/class/net \
+    | grep -Ev '^(lo|veth|tap|fwln|fwpr|virbr|vmbr|wg|docker|br-|bonding_masters)$' \
+    | sort)
+  ((${#NICS[@]})) || die "No se detectaron NICs físicas."
+
+  echo "Interfaces disponibles:"
+  local i=1
+  for n in "${NICS[@]}"; do
+    local ip4; ip4="$(ip -4 -o addr show "$n" 2>/dev/null | awk '{print $4}' | paste -sd, -)"
+    printf "  %d) %s %s\n" "$i" "$n" "${ip4:+(IP: $ip4)}"
+    ((i++))
+  done
+  local sel
+  while true; do
+    read -rp "➡️  Elige la NIC a puentear en vmbr0 [1-${#NICS[@]}]: " sel
+    [[ "$sel" =~ ^[0-9]+$ ]] && (( sel>=1 && sel<=${#NICS[@]} )) && break
+    echo "Selección inválida."
+  done
+  NIC="${NICS[$((sel-1))]}"
+  echo "Usando NIC: $NIC"
+}
+
+backup_interfaces(){
+  if [[ -f /etc/network/interfaces ]]; then
+    cp -a /etc/network/interfaces "/etc/network/interfaces.bak.$(date +%s)"
+    log "Backup de /etc/network/interfaces creado."
+  fi
+}
+
 configure_network(){
-  log "Configuración de red para Proxmox (vmbr0)…"
-
-  # Detectar primera NIC física razonable
-  NIC="$(ls -1 /sys/class/net | grep -E '^(en|eth)' | head -n1 || true)"
-  [[ -n "$NIC" ]] || die "No se detectó interfaz física. Configura /etc/network/interfaces manualmente."
-
-  echo "Interfaz detectada: $NIC"
-  read -rp "➡️  ¿Configurar red con DHCP? [S/n]: " yn
+  select_nic
+  backup_interfaces
+  echo
+  read -rp "➡️  ¿Configurar vmbr0 con DHCP? [S/n]: " yn
   if [[ "${yn,,}" == "n" ]]; then
-    read -rp "IP estática (ej: 192.168.1.100): " IPADDR
+    read -rp "IP estática (ej: 192.168.100.251): " IPADDR
     read -rp "Prefijo CIDR (ej: 24): " PREFIX
-    read -rp "Gateway (ej: 192.168.1.1): " GATEWAY
+    read -rp "Gateway (ej: 192.168.100.1): " GATEWAY
     read -rp "DNS (ej: 1.1.1.1 8.8.8.8): " DNS
     [[ -n "$IPADDR" && -n "$PREFIX" && -n "$GATEWAY" ]] || die "Datos de red incompletos."
 
@@ -179,7 +203,7 @@ iface vmbr0 inet static
     bridge-ports $NIC
     bridge-stp off
     bridge-fd 0
-    dns-nameservers $DNS
+    dns-nameservers ${DNS:-1.1.1.1}
 EOF
   else
     cat >/etc/network/interfaces <<EOF
@@ -200,7 +224,7 @@ EOF
   log "Archivo /etc/network/interfaces generado:"
   sed -n '1,200p' /etc/network/interfaces
 
-  # Aplica en caliente si es posible (no interrumpe si estás por consola)
+  # Aplica en caliente si está ifupdown2 (el reboot lo dejará definitivo igualmente)
   if command -v ifreload >/dev/null 2>&1; then
     ifreload -a || true
   fi
@@ -211,7 +235,7 @@ final_summary(){
   log "Instalación completada. Reiniciando…"
   echo
   echo "Acceso previsto tras reinicio:"
-  echo "  URL   : https://${HOST_IP:-<tu-IP>}:8006 (o la IP configurada)"
+  echo "  URL   : https://${HOST_IP:-<tu-IP>}:8006 (o la IP configurada en vmbr0)"
   echo "  Login : root  | Realm: PAM"
   echo
 }
