@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 # install-pve9-trixie-onepass.sh
-# Instala Proxmox VE 9 sobre Debian 13 (Trixie) en UNA sola pasada.
-# - Añade repo PVE (deb822) + keyring
-# - Instala proxmox-default-kernel + proxmox-ve + open-iscsi + ifupdown2 (+ chrony opcional)
-# - Configura hostname/FQDN y /etc/hosts
-# - Desactiva enterprise repo, aplica no-subscription, quita banner (community-scripts; fallback local)
-# - Elimina os-prober y kernels Debian genéricos
-# - Reboot final (una vez), con servicios PVE activos al volver.
+# Proxmox VE 9 sobre Debian 13 (Trixie) en una sola pasada:
+#  - Repo + keyring PVE (no-subscription)
+#  - proxmox-default-kernel + proxmox-ve + open-iscsi + ifupdown2 (+ chrony opcional)
+#  - Hostname/FQDN + /etc/hosts
+#  - Configuración de red interactiva con vmbr0 (DHCP o estática)
+#  - Desactivar repo enterprise, quitar banner suscripción (community-scripts; fallback local)
+#  - Eliminar kernels Debian + os-prober
+#  - Reboot final (único)
 
 set -euo pipefail
 
@@ -20,27 +21,24 @@ require_root(){ [[ "$(id -u)" -eq 0 ]] || die "Ejecuta como root."; }
 check_env(){
   . /etc/os-release
   [[ "${ID}" == "debian" ]] || die "Este script es solo para Debian."
-  [[ "${VERSION_CODENAME}" == "trixie" ]] || die "Se detectó ${VERSION_CODENAME}. Necesitas Debian 13 (trixie)."
+  [[ "${VERSION_CODENAME}" == "trixie" ]] || die "Necesitas Debian 13 (trixie); detectado: ${VERSION_CODENAME}."
   dpkg --print-architecture | grep -q '^amd64$' || die "Arquitectura no soportada: $(dpkg --print-architecture)."
 }
 
 ask_inputs(){
   read -rp "➡️  FQDN del host (ej. pve.hirusec.lan): " FQDN
   [[ -n "$FQDN" ]] || die "El FQDN es obligatorio."
-  read -rp "➡️  IP estática del host (Enter para autodetectar): " IPV4
+
   read -rp "➡️  Instalar Chrony (NTP)? [s/N]: " yn
   [[ "${yn,,}" == "s" ]] && INSTALL_CHRONY=1 || INSTALL_CHRONY=0
-  read -rp "➡️  Aplicar optimizaciones (no-subscription, quitar banner, ajustar APT)? [S/n]: " yn2
+
+  read -rp "➡️  Aplicar optimizaciones (no-subscription, quitar banner, ajustes APT)? [S/n]: " yn2
   [[ "${yn2,,}" == "n" ]] && RUN_TWEAKS=0 || RUN_TWEAKS=1
 }
 
 detect_ip(){
-  if [[ -n "${IPV4:-}" ]]; then
-    HOST_IP="$IPV4"
-  else
-    HOST_IP="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '/src/ {for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')"
-  fi
-  [[ -n "${HOST_IP:-}" ]] || die "No se pudo autodetectar IP. Define IPv4 manualmente."
+  HOST_IP="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '/src/ {for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}' || true)"
+  [[ -n "${HOST_IP:-}" ]] || HOST_IP="(definirás IP en la red)"
 }
 
 ensure_hostname(){
@@ -49,22 +47,20 @@ ensure_hostname(){
   if ! [[ "$curhn" == *.* ]]; then
     hostnamectl set-hostname "$FQDN"
   else
-    # Si ya hay un FQDN, lo respetamos
     FQDN="$curhn"
   fi
 }
 
 fix_hosts(){
   local short="${FQDN%%.*}"
-  # sanea 127.0.1.1 comentándolo si apunta al hostname
   sed -i -E "s/^127\.0\.1\.1\s+.*/# &/" /etc/hosts || true
-  # añade/actualiza entrada de IP real -> FQDN short
-  if grep -qE "^\s*${HOST_IP//./\\.}\s" /etc/hosts; then
-    sed -i -E "s|^(\s*${HOST_IP//./\\.}\s+).*|\1${FQDN} ${short}|" /etc/hosts
-  else
-    printf "%s\t%s %s\n" "$HOST_IP" "$FQDN" "$short" >> /etc/hosts
+  if [[ "$HOST_IP" != "(definirás IP en la red)" ]]; then
+    if grep -qE "^\s*${HOST_IP//./\\.}\s" /etc/hosts; then
+      sed -i -E "s|^(\s*${HOST_IP//./\\.}\s+).*|\1${FQDN} ${short}|" /etc/hosts
+    else
+      printf "%s\t%s %s\n" "$HOST_IP" "$FQDN" "$short" >> /etc/hosts
+    fi
   fi
-  # IPv6 básicos
   grep -q "^::1" /etc/hosts || cat >>/etc/hosts <<'EOF'
 ::1     localhost ip6-localhost ip6-loopback
 ff02::1 ip6-allnodes
@@ -85,11 +81,9 @@ EOF
 }
 
 add_pve_repo(){
-  log "Añadiendo repo Proxmox VE (deb822, no-subscription) + keyring…"
-  # Keyring
+  log "Añadiendo repo Proxmox VE (no-subscription) y keyring…"
   curl -fsSL https://enterprise.proxmox.com/debian/proxmox-archive-keyring-trixie.gpg \
     -o /usr/share/keyrings/proxmox-archive-keyring.gpg
-  # Repo PVE
   cat >/etc/apt/sources.list.d/pve-install-repo.sources <<'EOL'
 Types: deb
 URIs: http://download.proxmox.com/debian/pve
@@ -103,12 +97,11 @@ EOL
 
 secure_boot_warn(){
   if command -v mokutil >/dev/null 2>&1 && mokutil --sb-state 2>/dev/null | grep -qi 'enabled'; then
-    warn "Secure Boot habilitado: el kernel de Proxmox podría no arrancar. Recomiendo deshabilitarlo en la UEFI."
+    warn "Secure Boot habilitado: el kernel de Proxmox podría no arrancar. Considera deshabilitarlo en la UEFI."
   fi
 }
 
 preseed_postfix(){
-  # Evita preguntas interactivas de postfix
   echo "postfix postfix/main_mailer_type select Local only" | debconf-set-selections
   echo "postfix postfix/mailname string $FQDN" | debconf-set-selections
 }
@@ -118,7 +111,6 @@ install_all_packages(){
   preseed_postfix
   local extras="open-iscsi ifupdown2"
   [[ "${INSTALL_CHRONY:-0}" -eq 1 ]] && extras="$extras chrony"
-  # Instala todo de una vez; los servicios quedarán instalados ya en el primer paso.
   DEBIAN_FRONTEND=noninteractive apt -y install proxmox-default-kernel proxmox-ve postfix $extras
 }
 
@@ -129,7 +121,6 @@ remove_debian_kernel_and_osprober(){
 }
 
 disable_enterprise_and_enable_nosub(){
-  # Desactiva enterprise y habilita no-sub (ya lo tenemos arriba, pero por si existen .list)
   for f in /etc/apt/sources.list.d/pve-enterprise.list /etc/apt/sources.list.d/ceph.list; do
     [[ -f "$f" ]] && sed -i 's/^\s*deb /# &/' "$f" || true
   done
@@ -137,7 +128,6 @@ disable_enterprise_and_enable_nosub(){
 }
 
 apply_community_postinstall(){
-  # Integra tweaks (quitar banner, etc.). Si falla, aplica fallback.
   if [[ "${RUN_TWEAKS:-1}" -eq 1 ]]; then
     log "Aplicando optimizaciones community-scripts (post-pve-install.sh)…"
     if ! bash -c "$(curl -fsSL https://raw.githubusercontent.com/community-scripts/ProxmoxVE/main/tools/pve/post-pve-install.sh)"; then
@@ -148,11 +138,9 @@ apply_community_postinstall(){
 }
 
 nag_remove_fallback(){
-  # Fallback local para UI nag
   local file="/usr/share/javascript/proxmox-widget-toolkit/proxmoxlib.js"
   if [[ -f "$file" ]]; then
     cp -a "$file" "${file}.bak.$(date +%s)"
-    # Neutraliza chequeo de suscripción (cambios mínimos y resistentes a variaciones)
     sed -i -E \
       -e "s/(data\.status !== 'Active')/false/" \
       -e "s/gettext\('No valid subscription'\)/'Subscription'/" \
@@ -161,12 +149,69 @@ nag_remove_fallback(){
   fi
 }
 
+configure_network(){
+  log "Configuración de red para Proxmox (vmbr0)…"
+
+  # Detectar primera NIC física razonable
+  NIC="$(ls -1 /sys/class/net | grep -E '^(en|eth)' | head -n1 || true)"
+  [[ -n "$NIC" ]] || die "No se detectó interfaz física. Configura /etc/network/interfaces manualmente."
+
+  echo "Interfaz detectada: $NIC"
+  read -rp "➡️  ¿Configurar red con DHCP? [S/n]: " yn
+  if [[ "${yn,,}" == "n" ]]; then
+    read -rp "IP estática (ej: 192.168.1.100): " IPADDR
+    read -rp "Prefijo CIDR (ej: 24): " PREFIX
+    read -rp "Gateway (ej: 192.168.1.1): " GATEWAY
+    read -rp "DNS (ej: 1.1.1.1 8.8.8.8): " DNS
+    [[ -n "$IPADDR" && -n "$PREFIX" && -n "$GATEWAY" ]] || die "Datos de red incompletos."
+
+    cat >/etc/network/interfaces <<EOF
+auto lo
+iface lo inet loopback
+
+auto $NIC
+iface $NIC inet manual
+
+auto vmbr0
+iface vmbr0 inet static
+    address $IPADDR/$PREFIX
+    gateway $GATEWAY
+    bridge-ports $NIC
+    bridge-stp off
+    bridge-fd 0
+    dns-nameservers $DNS
+EOF
+  else
+    cat >/etc/network/interfaces <<EOF
+auto lo
+iface lo inet loopback
+
+auto $NIC
+iface $NIC inet manual
+
+auto vmbr0
+iface vmbr0 inet dhcp
+    bridge-ports $NIC
+    bridge-stp off
+    bridge-fd 0
+EOF
+  fi
+
+  log "Archivo /etc/network/interfaces generado:"
+  sed -n '1,200p' /etc/network/interfaces
+
+  # Aplica en caliente si es posible (no interrumpe si estás por consola)
+  if command -v ifreload >/dev/null 2>&1; then
+    ifreload -a || true
+  fi
+}
+
 final_summary(){
   echo
   log "Instalación completada. Reiniciando…"
   echo
   echo "Acceso previsto tras reinicio:"
-  echo "  URL   : https://${HOST_IP}:8006"
+  echo "  URL   : https://${HOST_IP:-<tu-IP>}:8006 (o la IP configurada)"
   echo "  Login : root  | Realm: PAM"
   echo
 }
@@ -185,6 +230,7 @@ main(){
   remove_debian_kernel_and_osprober
   disable_enterprise_and_enable_nosub
   apply_community_postinstall
+  configure_network
   final_summary
   sleep 2
   systemctl reboot
